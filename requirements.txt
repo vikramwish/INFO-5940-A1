@@ -3,3 +3,6 @@ openai-agents
 streamlit
 python-dotenv
 tavily
+altair
+graphviz
+pandas
