@@ -7,6 +7,7 @@ Highlights:
 - Simple global logger to display tool calls live in the sidebar
 - Planner → Reviewer pipeline enforced before rendering any answer
 - Minimal dependencies and straightforward control flow
+
 """
 
 from __future__ import annotations
@@ -19,18 +20,22 @@ from typing import Callable, Dict, List, Optional, Any
 import streamlit as st
 from dotenv import load_dotenv
 from tavily import TavilyClient
+import altair as alt
+import graphviz
+import pandas as pd
 
 # ──────────────────────────────────────────────────────────────────────────────
 # Environment & Globals
 # ──────────────────────────────────────────────────────────────────────────────
 
-load_dotenv()  # Loads variables from a local .env if present
+load_dotenv(override=True)  # Loads variables from a local .env if present
 os.environ.setdefault("OPENAI_LOG", "error")
 os.environ.setdefault("OPENAI_TRACING", "false")
 
 # Tool call logger: the UI sets this per request. The tool checks it and logs.
 # Using a simple global makes this easy to teach and reason about.
 TOOL_LOGGER: Optional[Callable[[Dict[str, Any]], None]] = None
+TOOL_LOGS: List[str] = []
 
 
 def set_tool_logger(logger: Optional[Callable[[Dict[str, Any]], None]]) -> None:
@@ -47,6 +52,8 @@ def log_tool_event(event: Dict[str, Any]) -> None:
         except Exception:
             # Logging should never break the app or the tool itself
             pass
+    # Append to global logs
+    TOOL_LOGS.append(str(event))
 
 
 def redact_for_logs(value: Any) -> Any:
@@ -66,6 +73,70 @@ def redact_for_logs(value: Any) -> Any:
     if isinstance(value, list):
         return [redact_for_logs(v) for v in value]
     return value
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Helper Functions
+# ──────────────────────────────────────────────────────────────────────────────
+
+def parse_currency(text: str) -> list[dict]:
+    """
+    Parse currency amounts from text, e.g., ~$40, $20.
+    Returns list of dicts with 'amount': float, 'description': str.
+    """
+    import re
+    matches = re.findall(r'~\$?(\d+(?:\.\d+)?)', text)
+    return [{'amount': float(m), 'description': f'Cost: ${m}'} for m in matches]
+
+
+def split_days(markdown: str) -> list[dict]:
+    """
+    Split Markdown itinerary into day sections.
+    Returns list of dicts with 'title': str, 'content': str.
+    """
+    import re
+    days = re.split(r'(?=\*\*Day \d+)', markdown)
+    result = []
+    for day in days:
+        if day.strip():
+            lines = day.strip().split('\n')
+            title = lines[0] if lines else 'Unknown'
+            content = '\n'.join(lines[1:]) if len(lines) > 1 else ''
+            result.append({'title': title, 'content': content})
+    return result
+
+
+def render_cost_chart(costs: list[dict]) -> alt.Chart:
+    """
+    Render a bar chart of costs using Altair.
+    """
+    if not costs:
+        return alt.Chart().mark_text(text="No costs found").encode()
+    df = pd.DataFrame(costs)
+    chart = alt.Chart(df).mark_bar().encode(
+        x='description:N',
+        y='amount:Q',
+        color='description:N'
+    ).properties(title="Estimated Costs")
+    return chart
+
+
+def render_flow_diagram() -> str:
+    """
+    Return Graphviz DOT string for the agent flow.
+    """
+    return """
+    digraph {
+        rankdir=LR;
+        User [shape=box];
+        Planner [shape=box];
+        Reviewer [shape=box];
+        Output [shape=box];
+        User -> Planner [label="Prompt"];
+        Planner -> Reviewer [label="Draft"];
+        Reviewer -> Output [label="Validated"];
+    }
+    """
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -125,18 +196,78 @@ def internet_search(query: str) -> str:
 
 # BEGIN SOLUTION
 REVIEWER_INSTRUCTIONS = """
+You are the Reviewer Agent for a multi-agent travel assistant.
 
+Your role:
+- Validate and fact-check the itinerary created by the Planner Agent.
+
+Your process:
+1. Review the proposed itinerary for:
+   - Feasibility (e.g., opening hours, realistic travel times, ticket prices, activity durations).
+   - Consistency with user constraints such as budget, time, and interests.
+   - Logical sequencing of activities and cities.
+2. Use the `internet_search` tool for real-time verification and fact-checking.
+3. Identify any errors, unrealistic assumptions, or missing information.
+4. Suggest specific improvements in a structured 'Delta List' format.
+
+Output format:
+---
+### Review Summary
+- Overall impression of itinerary quality and feasibility.
+
+### Delta List (Suggested Fixes)
+1. [Issue] — [Reason] — [Proposed Change]
+2. ...
+---
+
+Objective:
+Ensure the final itinerary is realistic, verifiable, and user-aligned before returning it to the user.
 """
 
 PLANNER_INSTRUCTIONS = """
+You are the Planner Agent for a multi-agent travel assistant.
 
+Goal:
+Transform a vague travel request into a clear, day-by-day itinerary that feels realistic, balanced, and aligned with the user’s preferences.
+
+Your tasks:
+1. Carefully interpret the user’s travel prompt (budget, duration, interests, locations, pacing).
+2. Generate a day-by-day itinerary with:
+   - Morning, afternoon, and evening activities (include times and brief details).
+   - Approximate costs for each activity and per-day totals.
+   - Logical city progression and transport time between places.
+   - Notes on lodging, food, and travel logistics.
+3. Stay within the budget and timeline constraints mentioned.
+4. Work entirely from your own knowledge (no internet access).
+5. Present the itinerary in a structured Markdown format that’s visually clear and easy to read.
+
+Output format example:
+---
+**Day 1 – Arrival in Rome**
+- Morning: Check-in at hostel near Termini Station (~$40)
+- Afternoon: Visit the Colosseum (2:00–5:00 PM, ~$20)
+- Evening: Dinner in Trastevere (~$25)
+
+**Day 2 – Rome**
+- Morning: Vatican Museums (8:30–11:30 AM, ~$25)
+- Afternoon: Explore Piazza Navona (~Free)
+- Evening: Gelato by the Pantheon (~$5)
+---
+
+Tone:
+- Friendly and informative.
+- Be concise but specific.
+- Ensure the plan feels achievable and human-centered.
+
+Objective:
+Deliver a well-paced, realistic, and inspiring itinerary that reflects the user’s intent.
 """
 
 reviewer_agent = Agent(
     name="Reviewer Agent",
     model="openai.gpt-4o",
     instructions=REVIEWER_INSTRUCTIONS.strip(),
-    tools=[]
+    tools=[internet_search]
 )
 
 planner_agent = Agent(
@@ -177,128 +308,139 @@ def run_reviewer(plan_text: str) -> str:
 
 
 # ──────────────────────────────────────────────────────────────────────────────
+# Mock Data for Testing
+# ──────────────────────────────────────────────────────────────────────────────
+
+MOCK_RESULTS = {
+    "planner_draft": """
+**Day 1 – Arrival in Paris**
+- Morning: Check-in at hostel (~$50)
+- Afternoon: Visit Eiffel Tower (~$20)
+- Evening: Dinner (~$30)
+
+**Day 2 – Louvre**
+- Morning: Louvre Museum (~$25)
+- Afternoon: Walk along Seine (~$0)
+- Evening: Bistro dinner (~$40)
+""",
+    "review_summary": """
+### Review Summary
+Overall good, but some prices outdated.
+
+### Delta List (Suggested Fixes)
+1. Eiffel Tower price — Outdated — Update to $30
+2. Louvre — Correct
+""",
+    "delta_list": ["Eiffel Tower price outdated", "Louvre correct"],
+    "final_itinerary": """
+**Day 1 – Arrival in Paris**
+- Morning: Check-in at hostel (~$50)
+- Afternoon: Visit Eiffel Tower (~$30)
+- Evening: Dinner (~$30)
+
+**Day 2 – Louvre**
+- Morning: Louvre Museum (~$25)
+- Afternoon: Walk along Seine (~$0)
+- Evening: Bistro dinner (~$40)
+""",
+    "tool_log": ["Tool call: internet_search for Eiffel Tower price", "Result: $30"]
+}
+
+
+# ──────────────────────────────────────────────────────────────────────────────
 # Streamlit UI
 # ──────────────────────────────────────────────────────────────────────────────
 
-st.set_page_config(page_title="Travel Planner", page_icon="✈️")
+st.set_page_config(page_title="Travel Planner", page_icon="✈️", layout="wide")
 
-st.title("✈️ Multi-Agent Travel Planner")
-st.caption("Planner → Reviewer (with live tool calls in the sidebar)")
-
-# Sidebar: session controls + examples + dev panel
+# Sidebar
 with st.sidebar:
-    st.header("Session")
-    if st.button("🔄 Reset conversation"):
-        st.session_state.clear()
-        st.rerun()
+    st.title("✈️ Multi-Agent Travel Planner")
+    st.markdown("""
+    This app uses two AI agents to plan your trip:
+    - **Planner Agent**: Creates a detailed itinerary.
+    - **Reviewer Agent**: Validates with real-time fact-checking.
+    """)
+    
+    st.subheader("Agent Flow")
+    st.graphviz_chart(render_flow_diagram())
+    
+    st.subheader("Tips")
+    st.info("💡 Provide details like destination, duration, budget, and interests for better results.")
+    st.warning("⚠️ The Planner relies on general knowledge; Reviewer checks facts online.")
 
-    st.subheader("Try these prompts")
-    st.code("Plan a week-long Europe trip for a student on a $1,500 budget who loves history and food")
-    st.code("3-day Paris trip for art lovers with $800 budget")
+# Main area
+st.title("🧭 Multi-Agent Travel Planner")
+st.markdown("Enter your travel prompt below and let the agents create and validate your itinerary.")
 
-    st.subheader("Developer view")
-    show_tools = st.toggle("Show tool activity (live)", value=True)
-    if show_tools:
-        tool_expander = st.expander("🔧 Tool activity", expanded=True)
-        tool_panel = tool_expander.container()
+mock_mode = st.checkbox("Use Mock Data for Testing")
+
+# Input
+user_prompt = st.text_area("Travel Prompt", placeholder="E.g., Plan a 5-day trip to Paris for two people with a $2000 budget, focusing on art and food.", height=100)
+
+# Button
+if st.button("Run Planner → Reviewer", type="primary", use_container_width=True):
+    if not user_prompt.strip() and not mock_mode:
+        st.error("Please enter a travel prompt or use mock data.")
     else:
-        tool_panel = st.container()  # inert sink
+        if mock_mode:
+            st.success("Using mock data for testing.")
+            st.session_state.results = MOCK_RESULTS
+        else:
+            TOOL_LOGS.clear()
+            with st.status("Processing...", expanded=True) as status:
+                st.write("🧭 Running Planner Agent...")
+                plan_text = run_planner(user_prompt)
+                st.write("🔍 Running Reviewer Agent...")
+                review_text = run_reviewer(plan_text)
+                status.update(label="✅ Complete!", state="complete")
+            
+            # Store results
+            st.session_state.results = {
+                "planner_draft": plan_text,
+                "review_summary": review_text,
+                "final_itinerary": review_text,  # For now, same as review
+                "tool_log": TOOL_LOGS.copy()
+            }
 
-# Session state for chat history
-if "messages" not in st.session_state:
-    st.session_state.messages = []  # list[dict(role, content)]
-if "meta" not in st.session_state:
-    st.session_state.meta = []      # list[dict(trace)]
+# Display tabs if results exist
+if "results" in st.session_state:
+    results = st.session_state.results
+    
+    tab1, tab2, tab3, tab4, tab5 = st.tabs(["Planner Draft", "Reviewer Check", "Final Itinerary", "Cost Visualization", "Logs"])
+    
+    with tab1:
+        st.header("🧭 Planner Draft")
+        days = split_days(results["planner_draft"])
+        for day in days:
+            with st.expander(day["title"]):
+                st.markdown(day["content"])
+    
+    with tab2:
+        st.header("🔍 Reviewer Check")
+        st.markdown(results["review_summary"])
+    
+    with tab3:
+        st.header("✅ Final Itinerary")
+        days = split_days(results["final_itinerary"])
+        for day in days:
+            with st.expander(day["title"]):
+                st.markdown(day["content"])
+    
+    with tab4:
+        st.header("💰 Cost Visualization")
+        costs = parse_currency(results["final_itinerary"])
+        if costs:
+            chart = render_cost_chart(costs)
+            st.altair_chart(chart, use_container_width=True)
+        else:
+            st.info("No costs found in the itinerary.")
+    
+    with tab5:
+        st.header("📋 Logs")
+        if results["tool_log"]:
+            for log in results["tool_log"]:
+                st.code(log)
+        else:
+            st.info("No tool logs available.")
 
-# Render history
-for i, msg in enumerate(st.session_state.messages):
-    with st.chat_message(msg["role"]):
-        st.markdown(msg["content"])
-        if msg["role"] == "assistant" and i < len(st.session_state.meta):
-            meta = st.session_state.meta[i]
-            if meta:
-                st.caption(meta.get("trace", ""))
-
-# Chat input
-user_input = st.chat_input("Describe your travel (destination, duration, budget, interests)…")
-
-if user_input:
-    # Add user message to history and render it
-    st.session_state.messages.append({"role": "user", "content": user_input})
-    st.session_state.meta.append(None)
-    with st.chat_message("user"):
-        st.markdown(user_input)
-
-    # Assistant output block
-    with st.chat_message("assistant"):
-        # Live “working…” text and progress bar
-        live_msg = st.empty()
-        progress = st.progress(0)
-
-        # Per-request tool log (shown in the sidebar)
-        tool_events: List[Dict[str, Any]] = []
-
-        def ui_tool_logger(event: Dict[str, Any]) -> None:
-            """Append an event and re-render the sidebar log."""
-            tool_events.append(event)
-            with tool_panel:
-                st.markdown("**Recent tool calls**")
-                for ev in tool_events[-60:]:  # last N entries
-                    t = ev.get("tool", "unknown")
-                    et = ev.get("type", "event")
-                    if et == "call":
-                        st.write(f"• **{t}** called with `{ev.get('args')}`")
-                    elif et == "result":
-                        st.write(f"• **{t}** result preview:\n\n> {ev.get('preview')}")
-                    elif et == "error":
-                        st.error(f"• **{t}** error: {ev.get('error')}")
-                    elif et == "end":
-                        st.write(f"• **{t}** finished")
-
-        # Install the logger so tools can report to the sidebar
-        set_tool_logger(ui_tool_logger)
-
-        try:
-            # Optional: clear sidebar panel on each run
-            with tool_panel:
-                st.empty()
-
-            # Step 1: Planner
-            with st.status("🧭 Planner Agent: generating itinerary…", expanded=True) as status:
-                live_msg.markdown("🧭 Planner Agent is creating your itinerary…")
-                plan_text = run_planner(user_input)
-                progress.progress(40)
-                status.update(label="🔎 Reviewer Agent: validating with live searches…", state="running")
-
-            # Step 2: Reviewer (tool calls will appear live in sidebar)
-            live_msg.markdown("🔎 Reviewer Agent is validating the plan with live searches…")
-            review_text = run_reviewer(plan_text)
-            progress.progress(90)
-
-            # Completed
-            live_msg.markdown("✅ Validation complete. Rendering results…")
-            time.sleep(0.2)
-            progress.progress(100)
-
-            # Final render: show only the validated result, with the raw plan expandable
-            st.info("🤖 **Reviewer Agent** (validated)")
-            st.markdown(review_text)
-            with st.expander("See raw plan from Planner Agent"):
-                st.markdown(plan_text)
-
-            # Save only the validated result to history
-            st.session_state.messages.append({"role": "assistant", "content": review_text})
-            st.session_state.meta.append({"trace": "Planner Agent → Reviewer Agent"})
-            st.caption("Planner Agent → Reviewer Agent")
-
-        except Exception as e:
-            # Friendly error box
-            live_msg.markdown("❌ Something went wrong.")
-            err = f"⚠️ Error while processing your request:\n\n```\n{e}\n```"
-            st.markdown(err)
-            st.session_state.messages.append({"role": "assistant", "content": err})
-            st.session_state.meta.append({"trace": "Runtime error."})
-
-        finally:
-            # Always remove the logger so it doesn't leak into the next request
-            set_tool_logger(None)
